@@ -8,17 +8,8 @@ interface VoiceAssistantProps {
   isSyncing?: boolean;
 }
 
-// Audio helpers (kept same)
-function createBlob(data: Float32Array): Blob {
-  const l = data.length;
-  const int16 = new Int16Array(l);
-  for (let i = 0; i < l; i++) {
-    int16[i] = data[i] * 32768;
-  }
-  return new Blob([int16], { type: 'audio/pcm' });
-}
-
-function decode(base64: string) {
+// Audio helpers
+function base64ToUint8Array(base64: string) {
   const binaryString = atob(base64);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
@@ -26,6 +17,38 @@ function decode(base64: string) {
     bytes[i] = binaryString.charCodeAt(i);
   }
   return bytes;
+}
+
+// Robust Downsampling Function (Any Rate -> 16kHz)
+function downsampleTo16k(input: Float32Array, sampleRate: number): Int16Array {
+    if (sampleRate === 16000) {
+        const res = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+            res[i] = Math.max(-1, Math.min(1, input[i])) * 32767;
+        }
+        return res;
+    }
+
+    const ratio = sampleRate / 16000;
+    const newLength = Math.round(input.length / ratio);
+    const result = new Int16Array(newLength);
+    
+    for (let i = 0; i < newLength; i++) {
+        const offset = Math.floor(i * ratio);
+        const nextOffset = Math.floor((i + 1) * ratio);
+        let sum = 0;
+        let count = 0;
+        
+        // Simple averaging for better quality than dropping samples
+        for (let j = offset; j < nextOffset && j < input.length; j++) {
+            sum += input[j];
+            count++;
+        }
+        
+        const avg = count > 0 ? sum / count : input[offset];
+        result[i] = Math.max(-1, Math.min(1, avg)) * 32767;
+    }
+    return result;
 }
 
 async function decodeAudioData(
@@ -124,14 +147,26 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
       `;
 
       // Setup Audio Contexts
-      inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      // NOTE: We do NOT force sampleRate: 16000 here anymore, because mobile browsers often ignore it or fail.
+      // We will handle resampling manually.
+      inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
       outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       
+      // Ensure context is running (fixes iOS autoplay policy)
+      await inputAudioContextRef.current.resume();
+      await outputAudioContextRef.current.resume();
+
       const outputNode = outputAudioContextRef.current!.createGain();
       outputNode.connect(outputAudioContextRef.current!.destination);
 
       // Get Mic Stream
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+        } 
+      });
       streamRef.current = stream;
 
       // Connect to Gemini Live
@@ -144,21 +179,22 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
 
             // Setup Input Processing
             if (!inputAudioContextRef.current) return;
+            
             const source = inputAudioContextRef.current.createMediaStreamSource(stream);
+            // Buffer size 4096 gives decent latency/performance balance
             const scriptProcessor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
             processorRef.current = scriptProcessor;
 
             scriptProcessor.onaudioprocess = (e) => {
+               // 1. Get raw float data (usually 44.1k or 48k on mobile)
                const inputData = e.inputBuffer.getChannelData(0);
-               // Simple downsample/encode
-               const l = inputData.length;
-               const int16 = new Int16Array(l);
-               for (let i = 0; i < l; i++) {
-                 int16[i] = inputData[i] * 32768;
-               }
+               const currentRate = inputAudioContextRef.current?.sampleRate || 16000;
                
-               // Helper to convert Uint8 array to Base64 string for the API
-               const bytes = new Uint8Array(int16.buffer);
+               // 2. Downsample to 16k
+               const pcm16 = downsampleTo16k(inputData, currentRate);
+               
+               // 3. Convert to Base64
+               const bytes = new Uint8Array(pcm16.buffer);
                let binary = '';
                const len = bytes.byteLength;
                for (let i = 0; i < len; i++) {
@@ -166,6 +202,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
                }
                const b64 = btoa(binary);
 
+               // 4. Send
                sessionPromiseRef.current?.then(session => {
                  session.sendRealtimeInput({ 
                     media: {
@@ -190,7 +227,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
                 nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
                 
                 const audioBuffer = await decodeAudioData(
-                    decode(base64Audio),
+                    base64ToUint8Array(base64Audio),
                     ctx,
                     24000,
                     1
@@ -220,14 +257,15 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
                 setStatus('listening');
             }
           },
-          onclose: () => {
-             console.log("Session Closed");
+          onclose: (e) => {
+             console.log("Session Closed", e);
              setStatus('idle');
              setIsActive(false);
           },
           onerror: (err) => {
              console.error("Session Error", err);
-             setError("Connection error");
+             // More descriptive error
+             setError("Session error. Check API Key or Connection.");
              stopSession();
           }
         },
@@ -237,7 +275,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
             speechConfig: {
                 voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
             },
-            tools: [{ googleSearch: {} }] // Attempt to enable search
+            tools: [{ googleSearch: {} }]
         }
       });
 
