@@ -1,0 +1,9 @@
+{
+  "name": "Neural Note Assistant",
+  "description": "A mobile-first voice assistant with a persistent knowledge base and visual recognition capabilities.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
