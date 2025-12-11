@@ -30,10 +30,6 @@ function arrayBufferToBase64(buffer: ArrayBuffer) {
   return btoa(binary);
 }
 
-/**
- * Downsamples audio from any sample rate to 16kHz (required by Gemini).
- * Simple averaging is used for performance on mobile.
- */
 function downsampleTo16k(input: Float32Array, sampleRate: number): Int16Array {
     if (sampleRate === 16000) {
         const res = new Int16Array(input.length);
@@ -64,15 +60,36 @@ function downsampleTo16k(input: Float32Array, sampleRate: number): Int16Array {
     return result;
 }
 
+/**
+ * Manually decodes raw PCM (Int16) data into an AudioBuffer.
+ * Gemini Live API sends raw PCM at 24kHz (usually).
+ */
+function pcmToAudioBuffer(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number = 24000,
+  numChannels: number = 1
+): AudioBuffer {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+        // Convert Int16 (-32768 to 32767) to Float32 (-1.0 to 1.0)
+        channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
+
 const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true, isSyncing = false }) => {
   const [isActive, setIsActive] = useState(false);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'listening' | 'speaking'>('idle');
   const [error, setError] = useState<string | null>(null);
 
-  // --- REFS ---
-  // Single AudioContext for both input and output to avoid mobile hardware conflicts
   const audioContextRef = useRef<AudioContext | null>(null);
-  
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -105,7 +122,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
     activeSourcesRef.current.clear();
     nextStartTimeRef.current = 0;
 
-    // 3. Close Context (optional, but good for battery)
+    // 3. Close Context
     if (audioContextRef.current) {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
@@ -114,7 +131,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
 
   const stopSession = useCallback(() => {
     isSessionOpenRef.current = false;
-    
     cleanupAudio();
 
     if (sessionPromiseRef.current) {
@@ -140,12 +156,28 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
       const apiKey = process.env.API_KEY;
       if (!apiKey) throw new Error("API Key missing");
 
-      // 1. Initialize Audio Context (Must be done after user gesture)
+      // --- CRITICAL CHANGE: Initialize Audio IN THE USER GESTURE ---
+      // This prevents mobile browsers from blocking the microphone or suspending the context
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioContextClass(); // Do not force sampleRate here, let OS decide
+      const ctx = new AudioContextClass(); 
       audioContextRef.current = ctx;
+      
+      // Force resume immediately
+      await ctx.resume();
 
-      // 2. Prepare System Prompt
+      // Get Stream immediately
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+              channelCount: 1,
+          } 
+      });
+      mediaStreamRef.current = stream;
+
+      // -----------------------------------------------------------
+
       const kbText = notes.map(n => `- [${n.type.toUpperCase()}] ${n.content} (Added: ${new Date(n.timestamp).toLocaleDateString()})`).join('\n');
       const systemInstruction = `
         You are a smart, helpful voice assistant for a personal knowledge base app.
@@ -161,8 +193,9 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
         ${kbText || "(Empty)"}
       `;
 
-      // 3. Connect to Gemini
       const ai = new GoogleGenAI({ apiKey });
+      
+      // Connect to Gemini
       sessionPromiseRef.current = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
@@ -179,14 +212,8 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
             isSessionOpenRef.current = true;
             setStatus('listening');
 
-            // Start Audio Stream AFTER session opens
-            try {
-                await startAudioInput(ctx);
-            } catch (err) {
-                console.error("Mic Error:", err);
-                setError("Microphone access failed");
-                stopSession();
-            }
+            // Setup audio pipeline now that we have everything ready
+            setupAudioPipeline(ctx, stream);
           },
           onmessage: async (msg: LiveServerMessage) => {
             const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
@@ -195,7 +222,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
             }
 
             if (msg.serverContent?.interrupted) {
-                // User interrupted the model
                 activeSourcesRef.current.forEach(s => {
                     try { s.stop(); } catch(e) {}
                 });
@@ -225,27 +251,13 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
     }
   };
 
-  const startAudioInput = async (ctx: AudioContext) => {
-      // Resume context if suspended (common on mobile)
-      if (ctx.state === 'suspended') {
-          await ctx.resume();
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-              channelCount: 1
-          } 
-      });
-      mediaStreamRef.current = stream;
+  const setupAudioPipeline = (ctx: AudioContext, stream: MediaStream) => {
+      if (!ctx || !stream) return;
 
       const source = ctx.createMediaStreamSource(stream);
       sourceNodeRef.current = source;
       
-      // Use ScriptProcessor for broad compatibility
-      // Buffer size 4096 = ~92ms at 44.1kHz, good balance
+      // Create a ScriptProcessor
       const processor = ctx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
@@ -260,7 +272,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
           // Convert to Base64
           const b64 = arrayBufferToBase64(pcm16.buffer);
 
-          // Send
           sessionPromiseRef.current?.then(session => {
              session.sendRealtimeInput({ 
                 media: {
@@ -272,8 +283,8 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
       };
 
       source.connect(processor);
-      // Connect processor to destination to keep it alive, but mute it to avoid feedback
-      // (Creating a mute gain node)
+      
+      // Keep processor alive hack
       const muteNode = ctx.createGain();
       muteNode.gain.value = 0;
       processor.connect(muteNode);
@@ -288,15 +299,15 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
       
       try {
           const audioBytes = base64ToUint8Array(base64Audio);
-          // decodeAudioData automatically resamples to ctx.sampleRate
-          const audioBuffer = await ctx.decodeAudioData(audioBytes.buffer);
+          
+          // Use MANUAL PCM decoding instead of ctx.decodeAudioData
+          const audioBuffer = pcmToAudioBuffer(audioBytes, ctx, 24000);
           
           const source = ctx.createBufferSource();
           source.buffer = audioBuffer;
           source.connect(ctx.destination);
           
           const currentTime = ctx.currentTime;
-          // Schedule next chunk
           const startTime = Math.max(currentTime, nextStartTimeRef.current);
           
           source.start(startTime);
@@ -307,7 +318,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
           source.onended = () => {
               activeSourcesRef.current.delete(source);
               if (activeSourcesRef.current.size === 0) {
-                  // Small delay to prevent flickering status
                   setTimeout(() => {
                       if (activeSourcesRef.current.size === 0 && isSessionOpenRef.current) {
                           setStatus('listening');
@@ -317,6 +327,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
           };
       } catch (err) {
           console.error("Audio Decode Error", err);
+          setError("Audio decode failed");
       }
   };
 
@@ -328,7 +339,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
     }
   };
 
-  // Watch for offline
   useEffect(() => {
     if (!isOnline && isActive) {
         stopSession();
@@ -336,7 +346,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ notes, isOnline = true,
     }
   }, [isOnline, isActive, stopSession]);
 
-  // Cleanup on unmount
   useEffect(() => {
       return () => {
           cleanupAudio();
